@@ -1,9 +1,9 @@
 /**
  * @file wardriving.cpp
  * @author IncursioHack - https://github.com/IncursioHack
- * @brief WiFi Wardriving with GPS module selection support
+ * @brief WiFi Wardriving Implementation
  * @version 0.3
- * @note Updated: 2024-08-28 by Rennan Cockles (https://github.com/rennancockles)
+ * @note Updated: 2024-11-28
  */
 
 #include "wardriving.h"
@@ -11,9 +11,11 @@
 #include "core/mykeyboard.h"
 #include "core/wifi_common.h"
 #include "core/sd_functions.h"
+#include <ctype.h>
 
 #define MAX_WAIT 5000
 #define CURRENT_YEAR 2024
+#define FS_CHECK_INTERVAL 300000 // Check file system every 5 minutes
 
 Wardriving::Wardriving() {
     setup();
@@ -29,6 +31,13 @@ void Wardriving::setup() {
 
     begin_wifi();
     if (!begin_gps()) return;
+
+    // Initialize MAC address tracking system
+    if (!initializeIndex()) {
+        padprintln("Failed to initialize index file");
+        end();
+        return;
+    }
 
     delay(500);
     return loop();
@@ -66,9 +75,40 @@ bool Wardriving::begin_gps() {
     return true;
 }
 
+bool Wardriving::checkFileSystem() {
+    FS *fs;
+    if(!getFsStorage(fs)) return false;
+    
+    if (!(*fs).exists("/BruceWardriving")) {
+        if (!(*fs).mkdir("/BruceWardriving")) return false;
+    }
+    
+    return true;
+}
+
 void Wardriving::end() {
+    // Close any open file handles
+    FS *fs;
+    if(getFsStorage(fs)) {
+        // Close any open index file
+        if ((*fs).exists(indexFilePath)) {
+            File indexFile = (*fs).open(indexFilePath, FILE_READ);
+            if (indexFile) indexFile.close();
+        }
+        
+        // Close current data file if exists
+        if (filename != "" && (*fs).exists("/BruceWardriving/"+filename)) {
+            File dataFile = (*fs).open("/BruceWardriving/"+filename, FILE_READ);
+            if (dataFile) dataFile.close();
+        }
+    }
+
     wifiDisconnect();
     GPSserial.end();
+    
+    // Reset file system state
+    indexFileInitialized = false;
+    
     returnToMenu = true;
     gpsConnected = false;
     delay(500);
@@ -76,11 +116,22 @@ void Wardriving::end() {
 
 void Wardriving::loop() {
     int count = 0;
+    unsigned long lastFsCheck = 0;
     returnToMenu = false;
+    
     while(1) {
         display_banner();
 
         if (checkEscPress() || returnToMenu) return end();
+
+        // Periodic file system check
+        unsigned long currentTime = millis();
+        if (currentTime - lastFsCheck >= FS_CHECK_INTERVAL) {
+            if (checkFileSystem()) {
+                initializeIndex(); // Re-initialize index file if needed
+            }
+            lastFsCheck = currentTime;
+        }
 
         if (GPSserial.available() > 0) {
             count = 0;
@@ -150,18 +201,18 @@ void Wardriving::dump_gps_data() {
 }
 
 String Wardriving::auth_mode_to_string(wifi_auth_mode_t authMode) {
-  switch (authMode) {
-    case WIFI_AUTH_OPEN: return "OPEN";
-    case WIFI_AUTH_WEP: return "WEP";
-    case WIFI_AUTH_WPA_PSK: return "WPA_PSK";
-    case WIFI_AUTH_WPA2_PSK: return "WPA2_PSK";
-    case WIFI_AUTH_WPA_WPA2_PSK: return "WPA_WPA2_PSK";
-    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2_ENTERPRISE";
-    case WIFI_AUTH_WPA3_PSK: return "WPA3_PSK";
-    case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2_WPA3_PSK";
-    case WIFI_AUTH_WAPI_PSK: return "WAPI_PSK";
-    default: return "UNKNOWN";
-  }
+    switch (authMode) {
+        case WIFI_AUTH_OPEN: return "OPEN";
+        case WIFI_AUTH_WEP: return "WEP";
+        case WIFI_AUTH_WPA_PSK: return "WPA_PSK";
+        case WIFI_AUTH_WPA2_PSK: return "WPA2_PSK";
+        case WIFI_AUTH_WPA_WPA2_PSK: return "WPA_WPA2_PSK";
+        case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2_ENTERPRISE";
+        case WIFI_AUTH_WPA3_PSK: return "WPA3_PSK";
+        case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2_WPA3_PSK";
+        case WIFI_AUTH_WAPI_PSK: return "WAPI_PSK";
+        default: return "UNKNOWN";
+    }
 }
 
 void Wardriving::scan_networks() {
@@ -194,20 +245,140 @@ void Wardriving::create_filename() {
     filename = String(timestamp) + "_wardriving.csv";
 }
 
+bool Wardriving::isValidMacString(const String& mac) {
+    if (mac.length() != 17) return false;
+    
+    for (size_t i = 0; i < 17; i++) {
+        if (i % 3 == 2) {
+            if (mac[i] != ':') return false;
+        } else {
+            if (!isxdigit(mac[i])) return false;
+        }
+    }
+    return true;
+}
+
+bool Wardriving::macStringToBytes(const String& mac, uint8_t* bytes) {
+    if (!isValidMacString(mac)) return false;
+    
+    for (size_t i = 0, byteIndex = 0; i < mac.length(); i += 3, byteIndex++) {
+        char hexPair[3] = {mac[i], mac[i+1], '\0'};
+        bytes[byteIndex] = strtol(hexPair, NULL, 16);
+    }
+    return true;
+}
+
+String Wardriving::bytesToMacString(const uint8_t* bytes) {
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]);
+    return String(macStr);
+}
+
+bool Wardriving::initializeIndex() {
+    if (indexFileInitialized) return true;
+    
+    if (!checkFileSystem()) return false;
+    
+    FS *fs;
+    if (!getFsStorage(fs)) return false;
+
+    if (!(*fs).exists(indexFilePath)) {
+        File indexFile = (*fs).open(indexFilePath, FILE_WRITE);
+        if (!indexFile) return false;
+        indexFile.close();
+        }
+    
+    indexFileInitialized = true;
+    return true;
+}
+
+bool Wardriving::isMacInCache(const String& mac) {
+    return macAddressCache.find(mac) != macAddressCache.end();
+}
+
+bool Wardriving::isMacInIndex(const String& mac) {
+    if (!indexFileInitialized && !initializeIndex()) return false;
+    
+    FS *fs;
+    if(!getFsStorage(fs)) return false;
+    
+    File indexFile = (*fs).open(indexFilePath, FILE_READ);
+    if (!indexFile) return false;
+
+    uint8_t searchBytes[BLOCK_SIZE];
+    if (!macStringToBytes(mac, searchBytes)) {
+        indexFile.close();
+        return false;
+    }
+
+    uint8_t fileBytes[BLOCK_SIZE];
+    bool found = false;
+    
+    while (indexFile.available() >= BLOCK_SIZE) {
+        if (indexFile.read(fileBytes, BLOCK_SIZE) != BLOCK_SIZE) break;
+        
+        if (memcmp(searchBytes, fileBytes, BLOCK_SIZE) == 0) {
+            found = true;
+            break;
+        }
+    }
+    
+    indexFile.close();
+    return found;
+}
+
+void Wardriving::addMacToCache(const String& mac) {
+    macAddressCache.insert(mac);
+    maintainCache();
+}
+
+bool Wardriving::addMacToIndex(const String& mac) {
+    if (!indexFileInitialized && !initializeIndex()) return false;
+    
+    FS *fs;
+    if(!getFsStorage(fs)) return false;
+    
+    File indexFile = (*fs).open(indexFilePath, FILE_APPEND);
+    if (!indexFile) return false;
+    
+    uint8_t bytes[BLOCK_SIZE];
+    if (!macStringToBytes(mac, bytes)) {
+        indexFile.close();
+        return false;
+    }
+    
+    bool success = (indexFile.write(bytes, BLOCK_SIZE) == BLOCK_SIZE);
+    indexFile.close();
+    return success;
+}
+
+void Wardriving::maintainCache() {
+    if (macAddressCache.size() > CACHE_CLEAN_THRESHOLD) {
+        size_t targetSize = CACHE_SIZE / 2;
+        while (macAddressCache.size() > targetSize) {
+            macAddressCache.erase(macAddressCache.begin());
+        }
+    }
+}
+
 void Wardriving::append_to_file(int network_amount) {
+    if (!checkFileSystem()) {
+        padprintln("Storage setup error");
+        returnToMenu = true;
+        return;
+    }
+
     FS *fs;
     if(!getFsStorage(fs)) {
-        padprintln("Storage setup error");
+        padprintln("Storage access error");
         returnToMenu = true;
         return;
     }
 
     if (filename == "") create_filename();
 
-    if (!(*fs).exists("/BruceWardriving")) (*fs).mkdir("/BruceWardriving");
-
-    bool is_new_file = false;
-    if(!(*fs).exists("/BruceWardriving/"+filename)) is_new_file = true;
+    bool is_new_file = !(*fs).exists("/BruceWardriving/"+filename);
     File file = (*fs).open("/BruceWardriving/"+filename, is_new_file ? FILE_WRITE : FILE_APPEND);
 
     if (!file) {
@@ -223,30 +394,63 @@ void Wardriving::append_to_file(int network_amount) {
 
     for (int i = 0; i < network_amount; i++) {
         String macAddress = WiFi.BSSIDstr(i);
+        String ssid = WiFi.SSID(i);
+        
+        // Validate MAC address format
+        if (!isValidMacString(macAddress)) {
+            padprintln("Invalid MAC format: " + macAddress);
+            continue;
+        }
 
-        // Check if MAC was already found in this session
-        if (registeredMACs.find(macAddress) == registeredMACs.end()) {
-            registeredMACs.insert(macAddress); // Adds MAC to file
+        // Skip empty or invalid SSIDs
+        if (ssid.length() == 0) {
+            continue;
+        }
+
+        // Check both cache and index for the MAC address
+        if (!isMacInCache(macAddress) && !isMacInIndex(macAddress)) {
+            // Add to cache first
+            addMacToCache(macAddress);
+            
+            // Try to add to index file
+            if (!addMacToIndex(macAddress)) {
+                padprintln("Failed to add MAC to index: " + macAddress);
+                continue;
+            }
+            
+            // Get channel information
             int32_t channel = WiFi.channel(i);
+            int32_t frequency = channel != 14 ? 2407 + (channel * 5) : 2484;
 
-            char buffer[512];
-            snprintf(buffer, sizeof(buffer), "%s,%s,[%s],%04d-%02d-%02d %02d:%02d:%02d,%d,%d,%d,%f,%f,%f,%f,,,WIFI\n",
-                macAddress.c_str(),
-                WiFi.SSID(i).c_str(),
-                auth_mode_to_string(WiFi.encryptionType(i)).c_str(),
+            // Format date and time first to avoid multiple function calls
+            char datetime[20];
+            snprintf(datetime, sizeof(datetime), "%04d-%02d-%02d %02d:%02d:%02d",
                 gps.date.year(), gps.date.month(), gps.date.day(),
-                gps.time.hour(), gps.time.minute(), gps.time.second(),
+                gps.time.hour(), gps.time.minute(), gps.time.second());
+
+            // Create main buffer with formatted data
+            char buffer[512];
+            snprintf(buffer, sizeof(buffer), 
+                "%s,%s,[%s],%s,%d,%d,%d,%.6f,%.6f,%.2f,%.2f,,,WIFI\n",
+                macAddress.c_str(),
+                ssid.c_str(),
+                auth_mode_to_string(WiFi.encryptionType(i)).c_str(),
+                datetime,
                 channel,
-                channel != 14 ? 2407 + (channel * 5) : 2484,
+                frequency,
                 WiFi.RSSI(i),
                 gps.location.lat(),
                 gps.location.lng(),
                 gps.altitude.meters(),
                 gps.hdop.hdop() * 1.0
             );
-            file.print(buffer);
 
-            wifiNetworkCount++;
+            // Write to file
+            if (file.print(buffer)) {
+                wifiNetworkCount++;
+            } else {
+                padprintln("Failed to write to file");
+            }
         }
     }
 
